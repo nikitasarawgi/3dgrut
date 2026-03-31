@@ -28,8 +28,8 @@ def load_3dgrut_gui_plugin():
         except ImportError:
             from .setup_gui import setup_gui
 
-            setup_gui()
-            import lib3dgrut_gui_cc as tdgui  # type: ignore
+            tdgui = setup_gui()
+            # import lib3dgrut_gui_cc as tdgui  # type: ignore
         _3dgrut_gui_plugin = tdgui
 
 
