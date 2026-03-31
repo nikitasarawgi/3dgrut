@@ -31,6 +31,7 @@ from threedgrut.datasets.utils import read_colmap_points3D_text, read_next_bytes
 from threedgrut.export.base import ExportableModel
 from threedgrut.export.ingp_exporter import INGPExporter
 from threedgrut.export.ply_exporter import PLYExporter
+from threedgrut.export.volumetric_ply_exporter import VolumetricPointCloudExporter
 from threedgrut.model.geometry import k_nearest_neighbors, nearest_neighbor_dist_cpuKD
 from threedgrut.optimizers import SelectiveAdam
 from threedgrut.utils.logger import logger
@@ -711,6 +712,16 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
         exporter.export(self, Path(mogt_path))
 
     @torch.no_grad()
+    def export_vol_ply(self, mogt_path: str):
+        vol_exporter = VolumetricPointCloudExporter(
+            resolution=128,
+            density_threshold=0.001,
+            max_points=500_000,
+            device="cuda",
+        )
+        vol_exporter.export(self, Path(mogt_path))
+
+    @torch.no_grad()
     def init_from_ply(self, mogt_path: str, init_model=True):
         plydata = PlyData.read(mogt_path)
 
@@ -829,3 +840,40 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
 
     def __len__(self):
         return self.positions.shape[0] if self.positions is not None else 0
+    
+    @torch.no_grad()
+    def compute_density_at(self, pts: torch.Tensor, gaussian_chunk_size: int = 2048) -> torch.Tensor:
+        """
+        pts: [B, 3] world coordinates
+        Returns: [B] density/opacity
+        Processes Gaussians in chunks to avoid OOM.
+        """
+        B = pts.shape[0]
+        N = self.get_positions().shape[0]
+        device = pts.device
+
+        means = self.get_positions().to(device)         # [N, 3]
+        scales = self.get_scale(True).to(device)        # [N, 3]
+        base_dens = self.get_density(True).squeeze(-1).to(device)   # [N]
+
+        density = torch.zeros(B, device=device)
+
+        # Process Gaussians in chunks
+        for start in range(0, N, gaussian_chunk_size):
+            end = min(start + gaussian_chunk_size, N)
+            means_chunk = means[start:end]      # [chunk, 3]
+            scales_chunk = scales[start:end]    # [chunk, 3]
+            dens_chunk = base_dens[start:end]   # [chunk]
+
+            # pts: [B, 3], means_chunk: [chunk, 3] -> [B, chunk, 3]
+            pts_exp = pts.unsqueeze(1)           # [B, 1, 3]
+            means_exp = means_chunk.unsqueeze(0) # [1, chunk, 3]
+            scales_exp = scales_chunk.unsqueeze(0) # [1, chunk, 3]
+
+            diff = (pts_exp - means_exp) / scales_exp  # [B, chunk, 3]
+            sq_dist = (diff ** 2).sum(dim=-1)          # [B, chunk]
+            gauss_val = torch.exp(-0.5 * sq_dist)      # [B, chunk]
+            weighted = gauss_val * dens_chunk.unsqueeze(0)  # [B, chunk]
+            density += weighted.sum(dim=1)                  # [B]
+
+        return density
