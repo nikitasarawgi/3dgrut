@@ -105,7 +105,6 @@ class GUI:
         )
         self.ps_point_cloud_buffer = self.ps_point_cloud.get_buffer("points")
 
-        # Only implemented for NeRF and Colmap dataset
         if isinstance(train_dataset, DatasetVisualization):
             train_dataset.create_dataset_camera_visualization()
         if isinstance(val_dataset, DatasetVisualization):
@@ -434,6 +433,8 @@ class GUI:
                 self.viz_render_subsample = max(self.viz_render_subsample, 1)
 
             _, self.viz_render_train_view = psim.Checkbox("render w/ train=True", self.viz_render_train_view)
+
+            psim.TreePop()
 
         if self.live_update:
             self.update_render_view_viz()

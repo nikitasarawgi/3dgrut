@@ -39,6 +39,8 @@ def load_mcmc_plugin():
     if _mcmc_plugin is None:
         try:
             from . import lib_mcmc_cc as gaussian_mcmc
+
+            _mcmc_plugin = gaussian_mcmc  # type: ignore
         except ImportError:
             from threedgrut.strategy.src.setup_mcmc import setup_mcmc
 
@@ -76,7 +78,7 @@ class MCMCStrategy(BaseStrategy):
             device=self.model.device,
         )
 
-    def post_optimizer_step(self, step: int, scene_extent: float, train_dataset, batch=None, writer=None) -> bool:
+    def _post_optimizer_step(self, step: int, scene_extent: float, train_dataset, batch=None, writer=None) -> bool:
         # Relocate dead gaussians to the alive areas
         if check_step_condition(
             step,

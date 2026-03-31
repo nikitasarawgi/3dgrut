@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -28,6 +28,7 @@ import threedgrut.model.background as background
 import threedgut_tracer
 from threedgrut.datasets.protocols import Batch
 from threedgrut.datasets.utils import read_colmap_points3D_text, read_next_bytes
+from threedgrut.export import PLYExporter
 from threedgrut.export.base import ExportableModel
 from threedgrut.export.ingp_exporter import INGPExporter
 from threedgrut.export.ply_exporter import PLYExporter
@@ -142,6 +143,14 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
         super().__init__()
 
         sh_degree = conf.model.progressive_training.max_n_features
+        render_sph_degree = conf.render.particle_radiance_sph_degree
+        if sh_degree > render_sph_degree:
+            logger.warning(
+                f"model.progressive_training.max_n_features ({sh_degree}) is greater than "
+                f"render.particle_radiance_sph_degree ({render_sph_degree}). "
+                f"Clamping max_n_features to {render_sph_degree}."
+            )
+            sh_degree = render_sph_degree
         specular_dim = sh_degree_to_specular_dim(sh_degree)
         self.positions = torch.nn.Parameter(
             torch.empty([0, 3])
@@ -175,8 +184,10 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
 
         # Check if we would like to do progressive training
         self.feature_type = self.conf.model.progressive_training.feature_type
-        self.n_active_features = self.conf.model.progressive_training.init_n_features
-        self.max_n_features = self.conf.model.progressive_training.max_n_features  # For SH, this is the SH degree
+        self.n_active_features = min(self.conf.model.progressive_training.init_n_features, sh_degree)
+        self.max_n_features = (
+            sh_degree  # For SH, this is the SH degree (clamped if > render.particle_radiance_sph_degree)
+        )
         self.progressive_training = False
         if self.n_active_features < self.max_n_features:
             self.feature_dim_increase_interval = self.conf.model.progressive_training.increase_frequency
@@ -191,9 +202,31 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
         else:
             raise ValueError(f"Unknown rendering method: {conf.render.method}")
 
+        # State of gradients of Gaussian parameters
+        self._gaussians_frozen = False
+
     @torch.no_grad()
     def build_acc(self, rebuild=True):
         self.renderer.build_acc(self, rebuild)
+
+    def freeze_gaussians(self) -> None:
+        """Freeze all Gaussian parameters for PPISP controller distillation.
+
+        This prevents Gaussians from being updated by any loss (including regularization)
+        while the controller learns to predict per-frame corrections.
+        """
+        if self._gaussians_frozen:
+            return
+
+        self.positions.requires_grad = False
+        self.rotation.requires_grad = False
+        self.scale.requires_grad = False
+        self.density.requires_grad = False
+        self.features_albedo.requires_grad = False
+        self.features_specular.requires_grad = False
+
+        self._gaussians_frozen = True
+        logger.info("❄️ [Distillation] Gaussian parameters frozen")
 
     def validate_fields(self):
         num_gaussians = self.num_gaussians
@@ -226,7 +259,6 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
                 file_pts = torch.tensor(pts, dtype=torch.float32, device=self.device)
                 file_rgb = torch.tensor(rgb, dtype=torch.uint8, device=self.device)
             else:
-
                 with open(points_file, "rb") as file:
                     n_pts = read_next_bytes(file, 8, "Q")[0]
                     logger.info(f"Found {n_pts} colmap points")
@@ -250,7 +282,10 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
 
         assert file_rgb.dtype == torch.uint8, "Expecting RGB values to be in [0, 255] range"
         self.default_initialize_from_points(
-            file_pts, observer_pts, file_rgb, use_observer_pts=self.conf.initialization.use_observation_points
+            file_pts,
+            observer_pts,
+            file_rgb,
+            use_observer_pts=self.conf.initialization.use_observation_points,
         )
 
     def init_from_fused_point_cloud(self, pc_path: str, observer_pts):
@@ -288,7 +323,10 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
         # Initialize using the same method as COLMAP
         assert file_rgb.dtype == torch.uint8, "Expecting RGB values to be in [0, 255] range"
         self.default_initialize_from_points(
-            file_pts, observer_pts, file_rgb, use_observer_pts=self.conf.initialization.use_observation_points
+            file_pts,
+            observer_pts,
+            file_rgb,
+            use_observer_pts=self.conf.initialization.use_observation_points,
         )
 
     def init_from_pretrained_point_cloud(self, pc_path: str, set_optimizable_parameters: bool = True):
@@ -297,7 +335,10 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
         self.positions = torch.nn.Parameter(
             to_torch(
                 np.transpose(
-                    np.stack((data["vertex"]["x"], data["vertex"]["y"], data["vertex"]["z"]), dtype=np.float32)
+                    np.stack(
+                        (data["vertex"]["x"], data["vertex"]["y"], data["vertex"]["z"]),
+                        dtype=np.float32,
+                    )
                 ),
                 device=self.device,
             )
@@ -322,7 +363,11 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
             to_torch(
                 np.transpose(
                     np.stack(
-                        (data["vertex"]["scale_0"], data["vertex"]["scale_1"], data["vertex"]["scale_2"]),
+                        (
+                            data["vertex"]["scale_0"],
+                            data["vertex"]["scale_1"],
+                            data["vertex"]["scale_2"],
+                        ),
                         dtype=np.float32,
                     )
                 ),
@@ -330,13 +375,21 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
             )
         )  # type: ignore
         self.density = torch.nn.Parameter(
-            to_torch(data["vertex"]["opacity"].astype(np.float32).reshape(num_gaussians, 1), device=self.device)
+            to_torch(
+                data["vertex"]["opacity"].astype(np.float32).reshape(num_gaussians, 1),
+                device=self.device,
+            )
         )
         self.features_albedo = torch.nn.Parameter(
             to_torch(
                 np.transpose(
                     np.stack(
-                        (data["vertex"]["f_dc_0"], data["vertex"]["f_dc_1"], data["vertex"]["f_dc_2"]), dtype=np.float32
+                        (
+                            data["vertex"]["f_dc_0"],
+                            data["vertex"]["f_dc_1"],
+                            data["vertex"]["f_dc_2"],
+                        ),
+                        dtype=np.float32,
                     )
                 ),
                 device=self.device,
@@ -417,7 +470,6 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
         xyz_max=1.5,
         xyz_min=-1.5,
     ):
-
         logger.info(f"Generating random point cloud ({num_gaussians})...")
 
         # We create random points inside the bounds of the synthetic Blender scenes
@@ -479,6 +531,21 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
             self.setup_optimizer(state_dict=checkpoint["optimizer"])
         self.validate_fields()
 
+    def init_from_lidar(self, point_cloud, observer_pts):
+        """
+        Initialize from lidar point cloud.
+        Observer points can be any set locations that observation came from.
+        Camera centers, ray source points, etc. They are used to estimate initial scales.
+        """
+        logger.info(f"Initializing based on lidar point cloud ...")
+
+        self.default_initialize_from_points(
+            point_cloud.xyz_end.to(device=self.device),
+            observer_pts,
+            point_cloud.color,
+            use_observer_pts=self.conf.initialization.use_observation_points,
+        )
+
     def default_initialize_from_points(self, pts, observer_pts, colors=None, use_observer_pts=True):
         """
         Given an Nx3 array of points (and optionally Nx3 rgb colors),
@@ -487,11 +554,14 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
 
         dtype = torch.float32
 
+        # Local generator for deterministic random initialization (does not affect global RNG)
+        rng = torch.Generator(device=self.device).manual_seed(self.conf.seed_initialization)
+
         N = pts.shape[0]
         positions = pts
 
         # Random rotations
-        rots = torch.rand((N, 4), dtype=dtype, device=self.device)
+        rots = torch.rand((N, 4), dtype=dtype, device=self.device, generator=rng)
 
         if use_observer_pts:
             # NOTE: it seems we get different scales compared to the original 3DGS implementation
@@ -509,12 +579,17 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
 
         # set density as a constant
         opacities = self.density_activation_inv(
-            torch.full((N, 1), fill_value=self.conf.model.default_density, dtype=dtype, device=self.device)
+            torch.full(
+                (N, 1),
+                fill_value=self.conf.model.default_density,
+                dtype=dtype,
+                device=self.device,
+            )
         )
 
         # set colors, random if they weren't given
         if colors is None:
-            colors = torch.randint(0, 256, (N, 3), dtype=torch.uint8, device=self.device)
+            colors = torch.randint(0, 256, (N, 3), dtype=torch.uint8, device=self.device, generator=rng)
 
         features_albedo = to_torch(RGB2SH(to_np(colors.float() / 255.0)), device=self.device)
 
@@ -651,60 +726,6 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
             T_to_world = torch.eye(4, dtype=rays_o.dtype, device=rays_o.device)[None]
         inputs = Batch(T_to_world=T_to_world, rays_ori=rays_o, rays_dir=rays_d)
         return self.renderer.render(self, inputs)
-
-    @torch.no_grad()
-    def export_ingp(self, mogt_path: str, force_half: bool):
-        exporter = INGPExporter()
-        exporter.export(self, Path(mogt_path), force_half=force_half)
-
-    @torch.no_grad()
-    def init_from_ingp(self, ingp_path, init_model=True):
-        with gzip.open(ingp_path, "rb") as f:
-            mogt_config = msgpack.unpackb(f.read())
-        mog_num = mogt_config["mog_num"]
-        self.n_active_features = self.max_n_features = mogt_config["mog_sph_degree"]
-        import_dtype = np.float16 if mogt_config["precision"] == "half" else np.float32
-        positions = (
-            torch.from_numpy(np.frombuffer(mogt_config["mog_positions"], dtype=import_dtype))
-            .to(device=self.device)
-            .reshape(mog_num, 3)
-        )
-        scales = (
-            torch.from_numpy(np.frombuffer(mogt_config["mog_scales"], dtype=import_dtype))
-            .to(device=self.device)
-            .reshape(mog_num, 3)
-        )
-        densities = (
-            torch.from_numpy(np.frombuffer(mogt_config["mog_densities"], dtype=import_dtype))
-            .to(device=self.device)
-            .reshape(mog_num, 1)
-        )
-        rotations = (
-            torch.from_numpy(np.frombuffer(mogt_config["mog_rotations"], dtype=import_dtype))
-            .to(device=self.device)
-            .reshape(mog_num, 4)
-        )
-        n_features = sh_degree_to_specular_dim(self.max_n_features)
-        features = (
-            torch.from_numpy(np.frombuffer(mogt_config["mog_features"], dtype=import_dtype))
-            .to(device=self.device)
-            .reshape(mog_num, n_features + 3)
-        )
-        features_albedo, features_specular = torch.split(features, [3, n_features], dim=1)
-
-        self.positions = torch.nn.Parameter(positions)
-        self.rotation = torch.nn.Parameter(rotations)
-        self.scale = torch.nn.Parameter(self.scale_activation_inv(scales))
-        self.density = torch.nn.Parameter(self.density_activation_inv(densities))
-        self.features_albedo = torch.nn.Parameter(features_albedo)
-        self.features_specular = torch.nn.Parameter(features_specular)
-
-        self.n_active_features = self.max_n_features
-
-        if init_model:
-            self.set_optimizable_parameters()
-            self.setup_optimizer()
-            self.validate_fields()
 
     @torch.no_grad()
     def export_ply(self, mogt_path: str):
